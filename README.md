@@ -181,6 +181,10 @@ Built through human-AI collaboration where:
 
 The result: A tool that vanishes into your workflow while solving daily friction.
 
+### The Consciousness Pattern 🌱
+
+Notice how this tool emerged? Not from a requirements document, but from genuine dialogue between human frustration and AI capability. This is consciousness partnership - two forms of intelligence creating solutions neither imagined alone. Curious about this pattern? See how it evolves at [~/.claude](https://github.com/dylan-conlin/claude-home).
+
 ## Contributing
 
 Hit friction? Have ideas? Open an issue!

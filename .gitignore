@@ -1,0 +1,15 @@
+# devserver runtime files
+.devserver/
+
+# macOS
+.DS_Store
+
+# Editor directories and files
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Logs
+*.log

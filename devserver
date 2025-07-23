@@ -1,0 +1,370 @@
+#!/bin/bash
+
+# Universal Dev Server Manager
+# Works seamlessly from Claude Code interactive sessions
+
+PROJECT_DIR="${PWD}"
+PROJECT_NAME=$(basename "$PROJECT_DIR")
+STATE_FILE="${PROJECT_DIR}/.devserver/state.json"
+LOG_FILE="${PROJECT_DIR}/.devserver/server.log"
+TMUX_SESSION="${PROJECT_NAME}-dev"
+
+# Ensure state directory exists
+mkdir -p "$(dirname "$STATE_FILE")"
+
+# Detect project type
+detect_project_type() {
+    if [ -f "package.json" ]; then
+        if grep -q '"next"' package.json; then
+            echo "nextjs"
+        elif grep -q '"vite"' package.json; then
+            echo "vite"
+        elif grep -q '"react-scripts"' package.json; then
+            echo "create-react-app"
+        elif grep -q '"astro"' package.json; then
+            echo "astro"
+        elif grep -q '"remix"' package.json; then
+            echo "remix"
+        elif grep -q '"nuxt"' package.json; then
+            echo "nuxt"
+        else
+            echo "node"
+        fi
+    elif [ -f "Cargo.toml" ]; then
+        echo "rust"
+    elif [ -f "go.mod" ]; then
+        echo "go"
+    elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+        echo "python"
+    else
+        echo "unknown"
+    fi
+}
+
+# Get dev command for project type
+get_dev_command() {
+    local project_type=$1
+    case $project_type in
+        nextjs)
+            if grep -q '"dev":' package.json; then
+                echo "npm run dev"
+            else
+                echo "next dev"
+            fi
+            ;;
+        vite|astro|remix|nuxt)
+            echo "npm run dev"
+            ;;
+        create-react-app)
+            echo "npm start"
+            ;;
+        rust)
+            echo "cargo run"
+            ;;
+        go)
+            echo "go run ."
+            ;;
+        python)
+            if [ -f "manage.py" ]; then
+                echo "python manage.py runserver"
+            elif [ -f "app.py" ]; then
+                echo "python app.py"
+            else
+                echo "python -m http.server 8000"
+            fi
+            ;;
+        *)
+            echo "npm run dev"
+            ;;
+    esac
+}
+
+# Get default port for project type
+get_default_port() {
+    local project_type=$1
+    case $project_type in
+        nextjs)
+            # Check if custom port in package.json
+            if grep -q '"dev":.*-p' package.json 2>/dev/null; then
+                grep '"dev":' package.json | grep -oE '\-p\s+[0-9]+' | grep -oE '[0-9]+' || echo "3000"
+            else
+                echo "3000"
+            fi
+            ;;
+        vite)
+            echo "5173"
+            ;;
+        create-react-app)
+            echo "3000"
+            ;;
+        astro)
+            echo "4321"
+            ;;
+        remix)
+            echo "3000"
+            ;;
+        nuxt)
+            echo "3000"
+            ;;
+        python)
+            echo "8000"
+            ;;
+        rust)
+            echo "8080"
+            ;;
+        go)
+            echo "8080"
+            ;;
+        *)
+            echo "3000"
+            ;;
+    esac
+}
+
+# Check if server is running
+is_running() {
+    if [ -f "$STATE_FILE" ]; then
+        local pid=$(jq -r '.pid' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Status command
+cmd_status() {
+    if is_running; then
+        local pid=$(jq -r '.pid' "$STATE_FILE")
+        local port=$(jq -r '.port' "$STATE_FILE")
+        local started=$(jq -r '.started' "$STATE_FILE")
+        local project_type=$(jq -r '.project_type' "$STATE_FILE")
+        
+        echo "✅ Dev server is running"
+        echo "   Type: $project_type"
+        echo "   PID: $pid"
+        echo "   Port: $port"
+        echo "   Started: $started"
+        echo "   URL: http://localhost:$port"
+        
+        # Show last 10 lines of logs
+        if [ -f "$LOG_FILE" ]; then
+            echo ""
+            echo "📋 Recent logs:"
+            echo "---"
+            tail -10 "$LOG_FILE"
+            echo "---"
+        fi
+    else
+        echo "❌ Dev server is not running"
+        
+        # Check for orphaned processes
+        local project_type=$(detect_project_type)
+        local default_port=$(get_default_port "$project_type")
+        if lsof -i ":$default_port" >/dev/null 2>&1; then
+            echo "⚠️  Warning: Port $default_port is in use by another process"
+            echo "   Run 'devserver kill' to clean up"
+        fi
+    fi
+}
+
+# Start command
+cmd_start() {
+    if is_running; then
+        echo "⚠️  Dev server is already running"
+        cmd_status
+        return 1
+    fi
+    
+    local project_type=$(detect_project_type)
+    local dev_command=$(get_dev_command "$project_type")
+    local port=$(get_default_port "$project_type")
+    
+    echo "🚀 Starting $project_type dev server..."
+    echo "   Command: $dev_command"
+    echo "   Port: $port"
+    
+    # Create or use existing tmux session
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        tmux new-session -d -s "$TMUX_SESSION"
+    fi
+    
+    # Start the dev server in tmux
+    tmux send-keys -t "$TMUX_SESSION" "cd $PROJECT_DIR" C-m
+    tmux send-keys -t "$TMUX_SESSION" "$dev_command 2>&1 | tee $LOG_FILE" C-m
+    
+    # Wait a moment for startup
+    sleep 2
+    
+    # Get the PID (try multiple approaches)
+    local pid=""
+    
+    # First try: get from ps matching the command
+    pid=$(ps aux | grep -v grep | grep "$dev_command" | awk '{print $2}' | head -1)
+    
+    # Second try: get process using the port
+    if [ -z "$pid" ]; then
+        sleep 2
+        pid=$(lsof -ti ":$port" | head -1)
+    fi
+    
+    # Save state
+    cat > "$STATE_FILE" <<EOF
+{
+  "pid": ${pid:-0},
+  "port": $port,
+  "started": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "project_type": "$project_type",
+  "command": "$dev_command",
+  "tmux_session": "$TMUX_SESSION"
+}
+EOF
+    
+    echo "✅ Dev server started successfully"
+    echo "   View logs: devserver logs"
+    echo "   Attach to tmux: devserver attach"
+}
+
+# Stop command
+cmd_stop() {
+    if ! is_running; then
+        echo "❌ Dev server is not running"
+        return 1
+    fi
+    
+    local pid=$(jq -r '.pid' "$STATE_FILE")
+    echo "🛑 Stopping dev server (PID: $pid)..."
+    
+    # Try graceful shutdown first
+    kill -TERM "$pid" 2>/dev/null
+    
+    # Wait up to 5 seconds
+    local count=0
+    while kill -0 "$pid" 2>/dev/null && [ $count -lt 5 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    
+    # Force kill if still running
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "⚠️  Graceful shutdown failed, forcing..."
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    
+    # Clean up state file
+    rm -f "$STATE_FILE"
+    
+    echo "✅ Dev server stopped"
+}
+
+# Restart command
+cmd_restart() {
+    echo "🔄 Restarting dev server..."
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+# Logs command
+cmd_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        echo "📋 Recent logs (last 50 lines):"
+        echo "---"
+        tail -50 "$LOG_FILE"
+        echo "---"
+        echo ""
+        echo "💡 Full logs at: $LOG_FILE"
+    else
+        echo "❌ No log file found"
+    fi
+}
+
+# Attach command
+cmd_attach() {
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo "📎 Attaching to tmux session: $TMUX_SESSION"
+        echo "   Detach with: Ctrl+B, D"
+        tmux attach-session -t "$TMUX_SESSION"
+    else
+        echo "❌ No tmux session found"
+    fi
+}
+
+# Kill command (cleanup orphaned processes)
+cmd_kill() {
+    echo "🧹 Cleaning up dev server processes..."
+    
+    # Kill by state file PID
+    if [ -f "$STATE_FILE" ]; then
+        local pid=$(jq -r '.pid' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        rm -f "$STATE_FILE"
+    fi
+    
+    # Get the port to clean up
+    local port=$(get_default_port "$(detect_project_type)")
+    
+    # Kill any process using the port
+    if lsof -i ":$port" >/dev/null 2>&1; then
+        echo "   Killing processes on port $port..."
+        lsof -ti ":$port" | xargs kill -9 2>/dev/null || true
+    fi
+    
+    # Kill common dev server processes for this directory
+    pkill -f "next.*$PROJECT_DIR" 2>/dev/null || true
+    pkill -f "node.*$PROJECT_DIR.*dev" 2>/dev/null || true
+    pkill -f "vite.*$PROJECT_DIR" 2>/dev/null || true
+    pkill -f "cargo run.*$PROJECT_DIR" 2>/dev/null || true
+    pkill -f "go run.*$PROJECT_DIR" 2>/dev/null || true
+    pkill -f "python.*$PROJECT_DIR" 2>/dev/null || true
+    
+    # Kill tmux session
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    
+    echo "✅ Cleanup complete"
+}
+
+# Main command handler
+case "$1" in
+    status|"")
+        cmd_status
+        ;;
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    restart)
+        cmd_restart
+        ;;
+    logs)
+        cmd_logs
+        ;;
+    attach)
+        cmd_attach
+        ;;
+    kill)
+        cmd_kill
+        ;;
+    *)
+        echo "Usage: devserver [status|start|stop|restart|logs|attach|kill]"
+        echo ""
+        echo "Commands:"
+        echo "  status   - Show dev server status and recent logs (default)"
+        echo "  start    - Start the dev server in tmux"
+        echo "  stop     - Stop the dev server gracefully"
+        echo "  restart  - Restart the dev server"
+        echo "  logs     - Show recent log output"
+        echo "  attach   - Attach to the tmux session"
+        echo "  kill     - Force kill all dev processes (cleanup)"
+        echo ""
+        echo "Supported project types:"
+        echo "  - Next.js, Vite, Create React App"
+        echo "  - Astro, Remix, Nuxt"
+        echo "  - Rust (cargo), Go, Python"
+        exit 1
+        ;;
+esac
